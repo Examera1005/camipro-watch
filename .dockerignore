@@ -1,0 +1,7 @@
+.git
+.env
+lockers_state.json
+*.tmp
+__pycache__
+venv
+README.md

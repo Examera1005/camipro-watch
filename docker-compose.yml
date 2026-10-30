@@ -1,0 +1,15 @@
+services:
+  camipro-watch:
+    build: .
+    container_name: camipro-watch
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./main.py:/app/main.py:ro
+      - ./.env:/app/.env
+      - ./lockers_state.json:/app/lockers_state.json
+    deploy:
+      resources:
+        limits:
+          memory: 40M

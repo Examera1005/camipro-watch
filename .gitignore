@@ -1,0 +1,13 @@
+# Fichiers sensibles et état local
+.env
+.env.*
+!.env.example
+lockers_state.json
+*.tmp
+last_valid_page.html
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
