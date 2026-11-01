@@ -2,13 +2,16 @@
 """Surveillance asynchrone 24/7 des casiers EPFL (MyCamipro v2 / AXS API) avec bot Telegram."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -32,11 +35,14 @@ AXS_API_BASE = os.getenv(
     "https://camipro-axs-ext.epfl.ch/axsapi/rest/v1",
 ).rstrip("/")
 PORTAL_URL = "https://mycamipro2.epfl.ch/home/equipment/lockers"
-ENTRA_TOKEN_URL = (
-    "https://login.microsoftonline.com/f6c2556a-c4fb-4ab1-a2c7-9e220df11c43/oauth2/v2.0/token"
-)
+ENTRA_TENANT = "f6c2556a-c4fb-4ab1-a2c7-9e220df11c43"
+ENTRA_BASE = f"https://login.microsoftonline.com/{ENTRA_TENANT}/oauth2/v2.0"
+ENTRA_AUTHORIZE_URL = f"{ENTRA_BASE}/authorize"
+ENTRA_TOKEN_URL = f"{ENTRA_BASE}/token"
+ENTRA_DEVICE_URL = f"{ENTRA_BASE}/devicecode"
 ENTRA_CLIENT_ID = "3fbb9202-de70-4ea9-abd2-a0c15d2262d8"
-ENTRA_SCOPE = "api://3fbb9202-de70-4ea9-abd2-a0c15d2262d8/MyCamipro.Identity email profile openid"
+ENTRA_REDIRECT_URI = "https://mycamipro2.epfl.ch/callback"
+ENTRA_SCOPE = "api://3fbb9202-de70-4ea9-abd2-a0c15d2262d8/MyCamipro.Identity email profile openid offline_access"
 
 STATE_FILE = Path(os.getenv("STATE_FILE", str(BASE_DIR / "lockers_state.json")))
 
@@ -56,7 +62,6 @@ def load_state(path: Path = STATE_FILE) -> Dict[str, int]:
 
 
 def save_state(state: Dict[str, int], path: Path = STATE_FILE) -> None:
-    # Écriture directe compatible avec un bind-mount Docker de fichier individuel
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -94,20 +99,73 @@ def save_env_var(key: str, value: str) -> None:
         log.warning("Impossible de sauvegarder %s dans .env : %s", key, exc)
 
 
-async def refresh_entra_token(
-    client: httpx.AsyncClient, refresh_token: str
-) -> Tuple[str, str]:
-    """Renouvelle automatiquement le Bearer token via le refresh_token Entra ID."""
-    if not refresh_token:
-        raise SessionExpiredError("Aucun MYCAMIPRO_REFRESH_TOKEN configuré pour renouveler la session")
+def normalize_ests_cookie(raw: str) -> str:
+    raw = raw.strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    if "ESTSAUTHPERSISTENT=" in raw or "ESTSAUTH=" in raw:
+        return raw
+    return f"ESTSAUTHPERSISTENT={raw}"
 
-    resp = await client.post(
+
+async def silent_pkce_login(
+    client: httpx.AsyncClient, ests_cookie: str
+) -> Tuple[str, str, str]:
+    """Renouvelle un jeton SPA expiré (24h, AADSTS700084) via le cookie SSO ESTSAUTHPERSISTENT (90j)."""
+    cookie_hdr = normalize_ests_cookie(ests_cookie)
+    if not cookie_hdr:
+        raise SessionExpiredError("Cookie ESTSAUTHPERSISTENT non configuré")
+
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    resp = await client.get(
+        ENTRA_AUTHORIZE_URL,
+        params={
+            "client_id": ENTRA_CLIENT_ID,
+            "scope": ENTRA_SCOPE,
+            "redirect_uri": ENTRA_REDIRECT_URI,
+            "response_type": "code",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "prompt": "none",
+        },
+        headers={
+            "Cookie": cookie_hdr,
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0.0.0",
+        },
+        follow_redirects=False,
+        timeout=15.0,
+    )
+
+    # Rotation éventuelle de ESTSAUTHPERSISTENT par Microsoft
+    for sc in resp.headers.get_list("set-cookie"):
+        if sc.startswith("ESTSAUTHPERSISTENT="):
+            new_val = sc.split(";", 1)[0].strip()
+            if new_val and new_val != "ESTSAUTHPERSISTENT=":
+                ests_cookie = new_val
+                save_env_var("MYCAMIPRO_ESTS_COOKIE", ests_cookie)
+
+    location = resp.headers.get("location", "")
+    parsed = urlparse(location)
+    qs = parse_qs(parsed.query) or parse_qs(parsed.fragment)
+    if "error" in qs:
+        err_desc = qs.get("error_description", [qs["error"][0]])[0]
+        raise SessionExpiredError(f"Échec silent login ESTS : {err_desc[:140]}")
+
+    code = (qs.get("code") or [""])[0]
+    if not code:
+        raise SessionExpiredError("Aucun code OAuth2 renvoyé par silent_pkce_login (cookie ESTSAUTHPERSISTENT expiré)")
+
+    tok_resp = await client.post(
         ENTRA_TOKEN_URL,
         data={
             "client_id": ENTRA_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "scope": ENTRA_SCOPE,
-            "refresh_token": refresh_token,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": ENTRA_REDIRECT_URI,
+            "code_verifier": verifier,
         },
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
@@ -115,19 +173,64 @@ async def refresh_entra_token(
         },
         timeout=15.0,
     )
-    if resp.status_code != 200:
-        raise SessionExpiredError(f"Échec du refresh Entra ID (HTTP {resp.status_code})")
+    if tok_resp.status_code != 200:
+        raise SessionExpiredError(f"Échec échange code PKCE (HTTP {tok_resp.status_code}): {tok_resp.text[:140]}")
 
-    data = resp.json()
+    data = tok_resp.json()
     new_access = data.get("access_token", "")
-    new_refresh = data.get("refresh_token", refresh_token)
+    new_refresh = data.get("refresh_token", "")
     if not new_access:
-        raise SessionExpiredError("Réponse Entra ID sans access_token")
+        raise SessionExpiredError("Réponse PKCE sans access_token")
 
     save_env_var("MYCAMIPRO_BEARER_TOKEN", new_access)
-    save_env_var("MYCAMIPRO_REFRESH_TOKEN", new_refresh)
-    log.info("Bearer token Entra ID renouvelé automatiquement avec succès.")
-    return new_access, new_refresh
+    if new_refresh:
+        save_env_var("MYCAMIPRO_REFRESH_TOKEN", new_refresh)
+    log.info("Session SPA renouvelée pour 24h via ESTSAUTHPERSISTENT (PKCE).")
+    return new_access, new_refresh, ests_cookie
+
+
+async def refresh_entra_token(
+    client: httpx.AsyncClient, refresh_token: str, ests_cookie: str = ""
+) -> Tuple[str, str, str]:
+    """Renouvelle le Bearer token via refresh_token (1h), puis fallback sur ESTSAUTHPERSISTENT si >24h (AADSTS700084)."""
+    if refresh_token:
+        # Essai sans Origin d'abord (si jeton issu de Device Code 90j), puis avec Origin SPA
+        for headers in (
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            {"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://mycamipro2.epfl.ch"},
+        ):
+            resp = await client.post(
+                ENTRA_TOKEN_URL,
+                data={
+                    "client_id": ENTRA_CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "scope": ENTRA_SCOPE,
+                    "refresh_token": refresh_token,
+                },
+                headers=headers,
+                timeout=15.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                new_access = data.get("access_token", "")
+                new_refresh = data.get("refresh_token", refresh_token)
+                if new_access:
+                    save_env_var("MYCAMIPRO_BEARER_TOKEN", new_access)
+                    save_env_var("MYCAMIPRO_REFRESH_TOKEN", new_refresh)
+                    log.info("Bearer token Entra ID renouvelé via refresh_token.")
+                    return new_access, new_refresh, ests_cookie
+            if "AADSTS9002327" not in resp.text:
+                break
+
+        log.warning("Refresh token expiré (limite SPA 24h AADSTS700084), tentative via ESTSAUTHPERSISTENT...")
+
+    if ests_cookie:
+        return await silent_pkce_login(client, ests_cookie)
+
+    raise SessionExpiredError(
+        "Le refresh_token SPA a atteint sa limite Microsoft de 24h (AADSTS700084) "
+        "et aucun cookie ESTSAUTHPERSISTENT (90j) n'est configuré"
+    )
 
 
 async def fetch_lockers(
@@ -135,9 +238,7 @@ async def fetch_lockers(
 ) -> Dict[str, int]:
     """Interroge camipro-axs-ext.epfl.ch/axsapi/rest/v1/lockergroups (+ /lockers par groupe)."""
     if not bearer:
-        raise SessionExpiredError(
-            "MYCAMIPRO_BEARER_TOKEN manquant (clé 'mycamipro.token.entra' dans Local Storage)"
-        )
+        raise SessionExpiredError("MYCAMIPRO_BEARER_TOKEN manquant")
 
     headers = {
         "Authorization": f"Bearer {bearer}",
@@ -162,7 +263,7 @@ async def fetch_lockers(
     content_type = resp.headers.get("content-type", "").lower()
     body = resp.text
     if "text/html" in content_type or "login.microsoftonline.com" in body or "<html" in body[:200].lower():
-        raise SessionExpiredError("Redirection vers la mire Microsoft Entra ID (Bearer token expiré ou invalide)")
+        raise SessionExpiredError("Redirection vers la mire Microsoft Entra ID (Bearer token expiré)")
 
     resp.raise_for_status()
     groups = resp.json()
@@ -224,7 +325,6 @@ async def broadcast_telegram(
 
 
 def format_zone_line(zone: str, count: int) -> str:
-    """Formate une ligne de notification avec lien direct vers plan.epfl.ch."""
     if "(" in zone and zone.endswith(")"):
         loc = zone.rsplit("(", 1)[1][:-1].strip()
         plan_url = f"https://plan.epfl.ch/?q={quote(loc)}"
@@ -243,6 +343,7 @@ async def monitor() -> None:
         "cookie": os.getenv("MYCAMIPRO_SESSION_COOKIE", "").strip(),
         "bearer": os.getenv("MYCAMIPRO_BEARER_TOKEN", "").strip(),
         "refresh": os.getenv("MYCAMIPRO_REFRESH_TOKEN", "").strip(),
+        "ests": os.getenv("MYCAMIPRO_ESTS_COOKIE", "").strip(),
         "state": load_state(),
         "session_ok": False,
         "session_alert_sent": False,
@@ -270,7 +371,7 @@ async def monitor() -> None:
                             ctx["chat_ids"].append(sender_id)
                             save_env_var("TELEGRAM_CHAT_ID", ",".join(ctx["chat_ids"]))
                             log.info("Nouvel abonné Telegram enregistré : %s", sender_id)
-                        status_line = "🟢 Connectée (auto-refresh actif)" if ctx["session_ok"] else "🟡 En cours..."
+                        status_line = "🟢 Connectée" if ctx["session_ok"] else "🔴 Expirée"
                         await send_telegram(
                             client,
                             token,
@@ -293,7 +394,8 @@ async def monitor() -> None:
                             "🔕 Vous êtes désabonné des alertes. Envoyez <code>/start</code> pour vous réabonner.",
                         )
                     elif text.startswith("/status"):
-                        status_icon = "🟢 Valide (auto-refresh actif)" if ctx["session_ok"] else "🔴 Expirée"
+                        ests_state = "Oui (90j)" if ctx["ests"] else "Non (limite SPA 24h)"
+                        status_icon = "🟢 Valide" if ctx["session_ok"] else "🔴 Expirée"
                         st = ctx["state"]
                         summary = (
                             "\n".join(format_zone_line(k, v) for k, v in st.items())
@@ -304,11 +406,12 @@ async def monitor() -> None:
                             client,
                             token,
                             sender_id,
-                            f"📊 <b>Statut Camipro Watch</b>\nSession : {status_icon}\n"
+                            f"📊 <b>Statut Camipro Watch</b>\n"
+                            f"Session : {status_icon}\n"
+                            f"Cookie 90j (ESTS) : {ests_state}\n"
                             f"Abonnés : {len(ctx['chat_ids'])}\n\n{summary}",
                         )
-                    elif text.startswith(("/token ", "/refresh ")):
-                        # Réservé au premier abonné (administrateur)
+                    elif text.startswith(("/token ", "/refresh ", "/ests ")):
                         admin_id = ctx["chat_ids"][0] if ctx["chat_ids"] else sender_id
                         if sender_id != admin_id:
                             await send_telegram(client, token, sender_id, "⛔ Commande réservée à l'administrateur.")
@@ -317,10 +420,14 @@ async def monitor() -> None:
                             ctx["bearer"] = text[len("/token "):].strip().strip('"').strip("'")
                             save_env_var("MYCAMIPRO_BEARER_TOKEN", ctx["bearer"])
                             msg_ack = "🔄 <b>Bearer token mis à jour !</b> Vérification immédiate..."
-                        else:
+                        elif text.startswith("/refresh "):
                             ctx["refresh"] = text[len("/refresh "):].strip().strip('"').strip("'")
                             save_env_var("MYCAMIPRO_REFRESH_TOKEN", ctx["refresh"])
-                            msg_ack = "🔄 <b>Refresh token mis à jour !</b>"
+                            msg_ack = "🔄 <b>Refresh token mis à jour !</b> Vérification immédiate..."
+                        else:
+                            ctx["ests"] = text[len("/ests "):].strip().strip('"').strip("'")
+                            save_env_var("MYCAMIPRO_ESTS_COOKIE", ctx["ests"])
+                            msg_ack = "🔄 <b>Cookie 90j ESTSAUTHPERSISTENT enregistré !</b> Renouvellement PKCE en cours..."
                         ctx["session_alert_sent"] = False
                         wakeup_event.set()
                         await send_telegram(client, token, sender_id, msg_ack)
@@ -340,9 +447,11 @@ async def monitor() -> None:
                 try:
                     current = await fetch_lockers(client, ctx["cookie"], ctx["bearer"])
                 except SessionExpiredError:
-                    if ctx["refresh"]:
-                        log.info("Renouvellement automatique via MYCAMIPRO_REFRESH_TOKEN...")
-                        ctx["bearer"], ctx["refresh"] = await refresh_entra_token(client, ctx["refresh"])
+                    if ctx["refresh"] or ctx["ests"]:
+                        log.info("Renouvellement automatique de la session Entra ID...")
+                        ctx["bearer"], ctx["refresh"], ctx["ests"] = await refresh_entra_token(
+                            client, ctx["refresh"], ctx["ests"]
+                        )
                         current = await fetch_lockers(client, ctx["cookie"], ctx["bearer"])
                     else:
                         raise
@@ -352,6 +461,13 @@ async def monitor() -> None:
                     ctx["session_alert_sent"] = False
                     total_free = sum(current.values())
                     log.info("Session MyCamipro valide (%d groupes, %d libres).", len(current), total_free)
+                    if ctx["chat_ids"]:
+                        await send_telegram(
+                            client,
+                            token,
+                            ctx["chat_ids"][0],
+                            f"✅ <b>Session MyCamipro rétablie !</b> ({len(current)} groupe(s) ouvert(s)).",
+                        )
 
                 opened = find_newly_available(ctx["state"], current)
                 if opened:
@@ -378,8 +494,11 @@ async def monitor() -> None:
                         token,
                         admin_id,
                         "⚠️ <b>Alerte MyCamipro : Session expirée</b>\n"
-                        f"Raison : <code>{exc}</code>\n"
-                        "Envoyez <code>/token NOUVEAU_TOKEN</code> ou <code>/refresh NOUVEAU_REFRESH</code>.",
+                        f"Raison : <code>{exc}</code>\n\n"
+                        "Pour activer le renouvellement automatique <b>90 jours</b> :\n"
+                        "1. Ouvrez <code>https://login.microsoftonline.com</code> (en ayant coché <i>Rester connecté</i>).\n"
+                        "2. Dans <code>F12</code> → <b>Application</b> → <b>Cookies</b> → <code>https://login.microsoftonline.com</code>, copiez la valeur de <b><code>ESTSAUTHPERSISTENT</code></b>.\n"
+                        "3. Envoyez ici : <code>/ests VOTRE_VALEUR</code>",
                     )
                     ctx["session_alert_sent"] = True
 
@@ -403,6 +522,7 @@ def _self_check() -> None:
     assert diff == {"Centre Est (CE 1 94.9)": 2}
     assert "plan.epfl.ch/?q=CE%201%2094.9" in format_zone_line("Centre Est (CE 1 94.9)", 2)
     assert parse_chat_ids("111, 222 ") == ["111", "222"]
+    assert normalize_ests_cookie("0.AXwA...") == "ESTSAUTHPERSISTENT=0.AXwA..."
     print("Self-check OK.")
 
 

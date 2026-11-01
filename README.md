@@ -7,12 +7,13 @@ Service autonome léger en Python asynchrone (`httpx` + `asyncio`, ~21 Mo de RAM
 ## ✨ Fonctionnalités
 
 - **Interrogation directe de l'API REST EPFL (`axsapi`) :** Vérifie toutes les **45 secondes** les groupes de casiers disponibles par bâtiment, étage et couloir exact (ex. `Centre Est (CE 1 94.9)`) avec lien direct vers le plan interactif **[plan.epfl.ch](https://plan.epfl.ch)**.
-- **Renouvellement OAuth2 automatique (Entra ID) :** Utilise le `refresh_token` Microsoft Entra ID de MyCamipro v2 pour renouveler automatiquement le jeton `Bearer` toutes les heures sans intervention manuelle (~90 jours de validité).
+- **Renouvellement OAuth2 automatique (Entra ID + PKCE 90 jours) :** Gère à la fois le `refresh_token` horaire et le renouvellement silencieux PKCE (`ESTSAUTHPERSISTENT`) toutes les 24h pour contourner la limite SPA Microsoft (`AADSTS700084`) pendant 90 jours.
 - **Zéro doublon :** Persiste l'état des zones dans un fichier local (`lockers_state.json`) et n'envoie une alerte que lorsqu'une zone passe de `0` (occupée) à `> 0` (disponible).
 - **Bot Telegram interactif sans latence (Long-Polling) :**
   - `/start` : s'abonner aux alertes de disponibilité (multi-utilisateurs supporté).
   - `/stop` : se désabonner.
   - `/status` : consulter instantanément (< 0.2s) l'état de la session et des casiers libres.
+  - `/ests <cookie>` : enregistrer le cookie `ESTSAUTHPERSISTENT` (90 jours) de `login.microsoftonline.com`.
   - `/token <jwt>` & `/refresh <token>` : mettre à jour les jetons à chaud depuis Telegram (réservé à l'administrateur).
 
 ---
